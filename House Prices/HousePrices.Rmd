@@ -1,0 +1,400 @@
+---
+title: "Kaggle Augusto"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r echo=FALSE}
+# EJECUTAR DOS VECES PARA QUE FUNCIONE
+
+# Tratamiento de datos
+# ==============================================================================
+library(MASS)
+library(dplyr)
+library(tidyr)
+library(skimr)
+
+# Gráficos
+# ==============================================================================
+library(ggplot2)
+library(ggpubr)
+
+# Preprocesado y modelado
+# ==============================================================================
+library(tidymodels)
+library(ranger)
+library(doParallel)
+
+# Metrics contiene la función MSE
+# ==============================================================================
+library(Metrics) 
+
+```
+
+# Leer las base de datos
+
+```{r}
+datos_test <- read.csv("test.csv",header = TRUE,encoding='UTF-8')
+datos_train <- read.csv("train.csv",header = TRUE,encoding='UTF-8')
+```
+
+```{r}
+apply(is.na(datos_train), 2, sum)
+```
+
+```{r}
+apply(is.na(datos_test), 2, sum)
+```
+
+
+
+# Todas las columnas numericas con NA se les reemplazan son 0 
+
+```{r}
+for(i in 1:length(datos_train)){
+  if (class(datos_train[[i]]) == "integer" || class(datos_train[[i]]) == "numeric"){
+    datos_train[i][is.na(datos_train[i])] <- 0
+  }
+}
+```
+
+
+```{r}
+for(i in 1:length(datos_test)){
+  if (class(datos_test[[i]]) == "integer" || class(datos_test[[i]]) == "numeric"){
+    datos_test[i][is.na(datos_test[i])] <- 0
+  }
+}
+```
+
+
+# Borrar columnas con Valores faltantes 
+
+```{r}
+borrar <- c()
+for(i in 1:length(datos_train)){
+  if (sum(is.na(datos_train[i])) > 0){
+    borrar <- c(borrar,names(datos_train[i]))
+  }
+}
+datos_test <- datos_test[ , !(names(datos_test) %in% borrar)]
+datos_train <- datos_train[ , !(names(datos_train) %in% borrar)]
+```
+
+
+```{r}
+borrar <- c()
+for(i in 1:length(datos_test)){
+  if (sum(is.na(datos_test[i])) > 0){
+    borrar <- c(borrar,names(datos_test[i]))
+  }
+}
+datos_test <- datos_test[ , !(names(datos_test) %in% borrar)]
+datos_train <- datos_train[ , !(names(datos_train) %in% borrar)]
+```
+
+
+
+# Creación y entrenamiento del modelo inicial
+
+
+```{r}
+
+modelo  <- ranger(
+            formula   = SalePrice ~ .,
+            data      = datos_train,
+            num.trees = 300,
+            seed = 123
+           )
+
+modelo
+
+```
+
+
+
+## Optimización de los hiperparametros
+
+```{r}
+# Evaluación de multiples modelos
+# ==============================================================================
+combinatoria = expand_grid(
+                  'num_trees' = c(300),
+                  'max_depth' = c(1, 3, 10, 20,40),
+                  'mtry' = seq(1, (length(datos_train)-1), by=4)
+              )
+
+# Ciclo para ajustar un modelo con cada combinación 
+# ==============================================================================
+
+r_cuadrado = rep(NA, nrow(combinatoria))
+
+for(i in 1:nrow(combinatoria)){
+
+  modelo <- ranger(
+              formula   = SalePrice ~ .,
+              data      = datos_train, 
+              num.trees = combinatoria$num_trees[i],
+              mtry      = combinatoria$mtry[i],
+              max.depth = combinatoria$max_depth[i],
+              seed      = 123
+            )
+  
+  # R cuadrado
+  
+  r_cuadrado[i] <- round(modelo$r.squared,4)
+    
+    
+  }
+  #Nota. Si no entra al condicional es porque no es posible calcular el modelo entonces las medidas estadisticas quedan nulas 
+  
+  
+
+
+# Resultados
+# ==============================================================================
+resultados <- combinatoria
+resultados$r_cuadrado <- r_cuadrado
+resultados <- arrange(resultados,desc(r_cuadrado))
+```
+
+
+```{r}
+# Top 10 de los modelos respecto al r_cuadrado
+# ==============================================================================
+head(resultados)
+```
+
+
+
+
+## Modelo predictivo optimo SIN importancia de los predictores
+
+```{r}
+# ENTRENAMIENTO FINAL
+# =============================================================================
+modelo  <- ranger(
+            formula   = SalePrice ~ .,
+            data      = datos_train,
+            num.trees = 300,
+            max.depth = 20,
+            mtry      = 29,
+            seed = 123
+           )
+
+print(modelo)
+```
+
+## Predicciones futuras
+
+
+```{r}
+modelo_predicciones <- predict(
+                              modelo, 
+                              data = datos_test
+                      )
+
+predicciones <- datos_test
+predicciones$SalePrice <- modelo_predicciones$predictions
+predicciones <- select(predicciones,Id, SalePrice)
+head(predicciones)
+```
+
+
+
+## Importancia de los predictores - permutation 
+
+
+```{r}
+# Entrenamiento modelo
+modelo  <- ranger(
+            formula    = SalePrice ~ .,
+            data       = datos_train,
+            num.trees  = 300,
+            mtry       = 30,
+            max.depth  = 20,
+            importance = "permutation",
+            seed       = 123
+           )
+
+# Importancia
+importancia_pred <- modelo$variable.importance %>%
+                    enframe(name = "predictor", value = "importancia")
+
+
+importancia_pred <- arrange(importancia_pred,importancia)
+head(importancia_pred,10)
+```
+
+
+
+## Optimizar el mejor metry con la combinación optima de parametros borrados con menor importancia
+
+```{r}
+resultadosUltimate <- data.frame()
+
+for(j in 1:nrow(importancia_pred)-1){
+  # Eliminar columnas con menor importancia
+  borrar <- head(importancia_pred$predictor,j)
+  datos_train_importancia <- datos_train[ , !(names(datos_train) %in% borrar)]
+  
+  
+  # Evaluación de multiples modelos
+  # ==============================================================================
+  combinatoria = expand_grid(
+                    'num_trees' = c(150),
+                    'mtry' = seq(1, (length(datos_train_importancia)-1), by=4)
+                    
+                )
+  
+  # Ciclo para ajustar un modelo con cada combinación 
+  # ==============================================================================
+  
+  r_cuadrado = rep(NA, nrow(combinatoria))
+  
+  for(i in 1:nrow(combinatoria)){
+  
+    modelo <- ranger(
+                formula   = SalePrice ~ .,
+                data      = datos_train_importancia, 
+                num.trees = combinatoria$num_trees[i],
+                mtry      = combinatoria$mtry[i],
+                seed      = 123
+              )
+    
+    # R cuadrado
+    
+    r_cuadrado[i] <- round(modelo$r.squared,4)
+      
+  }
+  
+  # Resultados
+  # ==============================================================================
+  resultados <- combinatoria
+  resultados$indice_borrar <- rep(j, nrow(combinatoria))
+  
+  resultados$r_cuadrado <- r_cuadrado
+  
+  resultadosUltimate <- rbind(resultadosUltimate,resultados)
+}
+```
+
+
+```{r}
+# Top 10 de los modelos respecto al r_cuadrado
+# ==============================================================================
+resultadosUltimate <- arrange(resultadosUltimate,desc(r_cuadrado))
+head(resultadosUltimate,10)
+```
+
+
+
+## Modelo predictivo optimo CON importancia de los predictores
+
+
+```{r}
+borrar <- head(importancia_pred$predictor,22)
+datos_train_importancia <- datos_train[ , !(names(datos_train) %in% borrar)]
+datos_test_importancia <- datos_test[ , !(names(datos_test) %in% borrar)]
+```
+
+
+
+## Optimizar hiperparametros num trees y max depth
+
+```{r}
+# Evaluación de multiples modelos
+# ==============================================================================
+combinatoria = expand_grid(
+                  'num_trees' = seq(200, 400, by=20),
+                  'max_depth' = seq(1, 40, by=4),
+                  'mtry' = 21
+              )
+
+# Ciclo para ajustar un modelo con cada combinación 
+# ==============================================================================
+
+r_cuadrado = rep(NA, nrow(combinatoria))
+
+for(i in 1:nrow(combinatoria)){
+
+  modelo <- ranger(
+              formula   = SalePrice ~ .,
+              data      = datos_train_importancia, 
+              num.trees = combinatoria$num_trees[i],
+              mtry      = combinatoria$mtry[i],
+              max.depth = combinatoria$max_depth[i],
+              seed      = 123
+            )
+  
+  # R cuadrado
+  
+  r_cuadrado[i] <- round(modelo$r.squared,4)
+    
+    
+  }
+  
+  
+
+
+# Resultados
+# ==============================================================================
+resultados <- combinatoria
+resultados$r_cuadrado <- r_cuadrado
+resultados <- arrange(resultados,desc(r_cuadrado))
+```
+
+
+```{r}
+# Top 10 de los modelos respecto al r_cuadrado
+# ==============================================================================
+head(resultados,10)
+```
+
+
+
+## Entrenamiento final
+
+```{r}
+# ENTRENAMIENTO FINAL
+# =============================================================================
+
+modelo  <- ranger(
+            formula   = SalePrice ~ .,
+            data      = datos_train_importancia,
+            num.trees = 200,
+            mtry      = 21,
+            max.depth = 17,
+            seed = 123
+           )
+
+print(modelo)
+```
+
+
+
+## Predicciones futuras
+
+
+```{r}
+modelo_predicciones <- predict(
+                              modelo, 
+                              data = datos_test_importancia
+                      )
+
+predicciones <- datos_test
+predicciones$SalePrice <- modelo_predicciones$predictions
+predicciones <- select(predicciones,Id, SalePrice)
+head(predicciones)
+```
+
+```{r}
+write.csv(predicciones,"submission.csv", row.names = FALSE, )
+```
+
+
